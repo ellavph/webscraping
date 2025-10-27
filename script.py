@@ -175,7 +175,7 @@ def salvar_informacoes_produto(idx, total, info_produto, caminhos_imagens=None):
         escritor.writerow(info_produto)
         
         # Adiciona o EAN ao cache para evitar reprocessamento
-        EANS_PROCESSADOS.add(ean_produto)
+        EANS_PROCESSADOS.add(info_produto['EAN'])
 
     print(f"{idx} de {total} - ✅ Produto {info_produto['Nome']} salvo em {NM_ARQUIVO} com sucesso!")
 
@@ -284,7 +284,7 @@ async def processar_produto_async(session, url, idx, total):
         
         # Baixa imagens de forma assíncrona (só se o produto não existir)
         urls_imagens = campos.get('_urls_imagens', [])
-        caminhos_imagens = await baixar_imagens_produto(session, urls_imagens, campos['EAN'])
+        caminhos_imagens = await baixar_imagens_produto(session, urls_imagens, ean_produto)
         
         # Salva informações do produto
         salvar_informacoes_produto(idx, total, campos, caminhos_imagens)
