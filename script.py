@@ -7,21 +7,112 @@ import csv
 from urllib.parse import urlparse
 from pathlib import Path
 import hashlib
+import random
 import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 
-NM_ARQUIVO = f"produtos_{time.strftime('%Y-%m-%d')}.csv"
+# NM_ARQUIVO = f"produtos_{time.strftime('%Y-%m-%d')}.csv"
+NM_ARQUIVO = f"produtos_2025-10-27.csv"
 DIRETORIO_IMAGENS = "imagens_produtos"
 # URL_SITEMAP = 'https://www.saojoaofarmacias.com.br/sitemap/product-10.xml'
-URL_SITEMAP = 'https://www.saojoaofarmacias.com.br/sitemap.xml'
+# URL_SITEMAP = 'https://www.saojoaofarmacias.com.br/sitemap.xml'
+URL_SITEMAP = 'https://www.drogariasaopaulo.com.br/sitemap.xml'
 
 # Cache para EANs já processados (otimização de velocidade)
 EANS_PROCESSADOS = set()
 
 # Configurações de concorrência
-MAX_CONCURRENT_REQUESTS = 20
-MAX_CONCURRENT_IMAGES = 10
+MAX_CONCURRENT_REQUESTS = 8
+MAX_CONCURRENT_IMAGES = 4
+
+# Configurações de retry/backoff
+MAX_RETRIES = 5
+BACKOFF_BASE_SECONDS = 0.5
+BACKOFF_CAP_SECONDS = 8.0
+
+HTTP_DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+}
+
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+async def _respect_retry_after(response):
+    try:
+        retry_after = response.headers.get('Retry-After')
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                delay = 0
+            if delay > 0:
+                await asyncio.sleep(delay)
+    except Exception:
+        return
+
+async def _exponential_backoff_sleep(attempt):
+    base = BACKOFF_BASE_SECONDS * (2 ** attempt)
+    delay = min(base, BACKOFF_CAP_SECONDS)
+    jitter = random.uniform(0, delay * 0.25)
+    await asyncio.sleep(delay + jitter)
+
+async def fetch_text_with_retry(session, url, timeout=30, max_retries=MAX_RETRIES):
+    for attempt in range(max_retries + 1):
+        try:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 200:
+                    return await response.text()
+                if response.status in RETRIABLE_STATUS_CODES:
+                    await _respect_retry_after(response)
+                    if attempt < max_retries:
+                        await _exponential_backoff_sleep(attempt)
+                        continue
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt < max_retries:
+                await _exponential_backoff_sleep(attempt)
+                continue
+            return None
+
+async def fetch_json_with_retry(session, url, timeout=30, max_retries=MAX_RETRIES):
+    for attempt in range(max_retries + 1):
+        try:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 200:
+                    return await response.json()
+                if response.status in RETRIABLE_STATUS_CODES:
+                    await _respect_retry_after(response)
+                    if attempt < max_retries:
+                        await _exponential_backoff_sleep(attempt)
+                        continue
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt < max_retries:
+                await _exponential_backoff_sleep(attempt)
+                continue
+            return None
+
+async def fetch_bytes_with_retry(session, url, timeout=30, max_retries=MAX_RETRIES):
+    for attempt in range(max_retries + 1):
+        try:
+            async with session.get(url, timeout=timeout) as response:
+                if response.status == 200:
+                    return await response.read()
+                if response.status in RETRIABLE_STATUS_CODES:
+                    await _respect_retry_after(response)
+                    if attempt < max_retries:
+                        await _exponential_backoff_sleep(attempt)
+                        continue
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt < max_retries:
+                await _exponential_backoff_sleep(attempt)
+                continue
+            return None
 
 def carregar_eans_existentes():
     """
@@ -67,18 +158,16 @@ async def baixar_imagem_async(session, url_imagem, ean_produto, idx_imagem=0):
         # Cria o diretório se não existir
         Path(DIRETORIO_IMAGENS).mkdir(exist_ok=True)
         
-        # Faz o download da imagem de forma assíncrona
-        async with session.get(url_imagem, timeout=30) as response:
-            if response.status != 200:
-                print(f"  ❌ Erro HTTP {response.status} para EAN {ean_produto}: {url_imagem}")
-                return ""
-            
-            content = await response.read()
-            
-            # Verifica se o conteúdo não está vazio
-            if len(content) < 100:  # Imagens válidas são maiores que 100 bytes
-                print(f"  ⚠️ Conteúdo muito pequeno para EAN {ean_produto}: {len(content)} bytes")
-                return ""
+        # Faz o download da imagem com retry/backoff
+        content = await fetch_bytes_with_retry(session, url_imagem, timeout=30)
+        if not content:
+            print(f"  ❌ Erro ao baixar imagem (falha após retries) para EAN {ean_produto}: {url_imagem}")
+            return ""
+        
+        # Verifica se o conteúdo não está vazio
+        if len(content) < 100:  # Imagens válidas são maiores que 100 bytes
+            print(f"  ⚠️ Conteúdo muito pequeno para EAN {ean_produto}: {len(content)} bytes")
+            return ""
         
         # Gera nome baseado no EAN
         parsed_url = urlparse(url_imagem)
@@ -183,7 +272,7 @@ def salvar_informacoes_produto(idx, total, info_produto, caminhos_imagens=None):
 def mapear_campos(info_produto):
     dados = {}
     info_produto = info_produto[0]
-    dados['Origem'] = 'São João Farmácias'
+    dados['Origem'] = 'Drogaria São Paulo'
     dados['Link'] = info_produto['link']
     dados['EAN'] = info_produto['items'][0]['ean']
     dados['Nome'] = info_produto.get('productName', '')
@@ -253,11 +342,10 @@ async def processar_produto_async(session, url, idx, total):
     Processa um produto de forma assíncrona
     """
     try:
-        # Faz requisição para página do produto
-        async with session.get(url, timeout=30) as response:
-            if response.status != 200:
-                return None
-            pagina = await response.text()
+        # Faz requisição para página do produto com retry/backoff
+        pagina = await fetch_text_with_retry(session, url, timeout=30)
+        if not pagina:
+            return None
         
         # Extrai productId
         padrao_id = re.search(r'productId["\']?\s*[:=]\s*["\']?(\d+)', pagina)
@@ -265,13 +353,13 @@ async def processar_produto_async(session, url, idx, total):
             return None
         
         product_id = padrao_id.group(1)
-        url_request = f'https://www.saojoaofarmacias.com.br/api/catalog_system/pub/products/search/?fq=productId:{product_id}'
-        
-        # Faz requisição para API do produto
-        async with session.get(url_request, timeout=30) as api_response:
-            if api_response.status != 200:
-                return None
-            info_produto = await api_response.json()
+        # url_request = f'https://www.saojoaofarmacias.com.br/api/catalog_system/pub/products/search/?fq=productId:{product_id}'
+        url_request = f'https://www.drogariasaopaulo.com.br/api/catalog_system/pub/products/search?fq=skuId:{product_id}'
+
+        # Faz requisição para API do produto com retry/backoff
+        info_produto = await fetch_json_with_retry(session, url_request, timeout=30)
+        if not info_produto:
+            return None
         
         # Mapeia campos
         campos = mapear_campos(info_produto)
@@ -327,15 +415,13 @@ async def webscraping_async():
     connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
     timeout = aiohttp.ClientTimeout(total=60)
     
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=HTTP_DEFAULT_HEADERS) as session:
         # Busca sitemaps de produtos
-        async with session.get(URL_SITEMAP) as response:
-            if response.status != 200:
-                print(f"Erro ao acessar sitemap: {response.status}")
-                return
-            
-            content = await response.text()
-            root = ET.fromstring(content)
+        content = await fetch_text_with_retry(session, URL_SITEMAP)
+        if not content:
+            print("Erro ao acessar sitemap: falha após retries")
+            return
+        root = ET.fromstring(content)
 
         urls_produtos = []
         for sitemap in root.findall(".//{*}sitemap"):
@@ -350,34 +436,33 @@ async def webscraping_async():
         for sitemap_url in urls_produtos:
             print(f"📋 Processando sitemap: {sitemap_url}")
             
-            async with session.get(sitemap_url) as response:
-                if response.status != 200:
-                    print(f"Erro ao acessar sitemap: {response.status}")
+            try:
+                content = await fetch_text_with_retry(session, sitemap_url)
+                if not content:
+                    print("Erro ao acessar sitemap de produtos: falha após retries")
+                    continue
+                root = ET.fromstring(content)
+                urls = [loc.text for loc in root.iter() if 'loc' in loc.tag]
+                
+                if not urls:
                     continue
                 
-                try:
-                    content = await response.text()
-                    root = ET.fromstring(content)
-                    urls = [loc.text for loc in root.iter() if 'loc' in loc.tag]
+                print(f"📦 Processando {len(urls)} produtos do sitemap...")
+                
+                # Processa em lotes para melhor controle
+                batch_size = 40
+                for i in range(0, len(urls), batch_size):
+                    batch = urls[i:i + batch_size]
+                    sucessos = await processar_produtos_batch(session, batch, i + 1, len(urls))
+                    total_produtos_processados += sucessos
                     
-                    if not urls:
-                        continue
+                    # Pausa com jitter para não sobrecarregar o servidor
+                    pause = 1.5 + random.uniform(0, 1.25)
+                    await asyncio.sleep(pause)
                     
-                    print(f"📦 Processando {len(urls)} produtos do sitemap...")
-                    
-                    # Processa em lotes para melhor controle
-                    batch_size = 50
-                    for i in range(0, len(urls), batch_size):
-                        batch = urls[i:i + batch_size]
-                        sucessos = await processar_produtos_batch(session, batch, i + 1, len(urls))
-                        total_produtos_processados += sucessos
-                        
-                        # Pequena pausa entre lotes para não sobrecarregar o servidor
-                        await asyncio.sleep(0.5)
-                    
-                except ET.ParseError:
-                    print("O conteúdo retornado não é um XML válido.")
-                    continue
+            except ET.ParseError:
+                print("O conteúdo retornado não é um XML válido.")
+                continue
 
     print(f"🎉 Processamento concluído! Total de produtos processados: {total_produtos_processados}")
 
